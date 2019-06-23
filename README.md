@@ -4,3 +4,9 @@ migrate stashes and non-pushed updates from old copy of a repository to a new on
 ## digest.sh
 - query any unpushed local branches
 - query stash updates
+
+## TODO:
+- add extract script
+- extract to relative path
+- add man and help pages
+- package scripts for easy install 

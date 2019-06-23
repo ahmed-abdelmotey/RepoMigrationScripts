@@ -1,0 +1,195 @@
+#!/bin/bash
+
+# exit if not inside a git directory
+if [[ ! $( git rev-parse --is-inside-work-tree 2> /dev/null ) ]]; then
+  echo -e "\e[31mMigrate: Command is only allowed inside a git directory"
+  exit 1
+fi
+
+# handle user input options
+TEMP=`getopt -o cfaertvdsho: --long compress,skipfetch,output:,all,emptybranches,relative,stash,verbose,dry,squash,help \
+             -n 'Migrate' -- "$@"` 
+
+if [ $? != 0 ] ; then echo "Terminating..." >&2 ; exit 1 ; fi
+
+eval set -- "$TEMP"
+
+verbose=false
+dry=false
+stash=false
+squash=false
+empty=false
+outputfolder="backup"
+relative=false
+skipfetch=false
+compress=false
+while true; do
+  case "$1" in
+    -h | --help ) man ./testman; exit 0 ;; 
+    -v | --verbose ) verbose=true; shift ;;
+    -d | --dry ) dry=true; shift ;; 
+    -t | --stash ) stash=true; shift ;; 
+    -e | --emptybranches ) empty=true; shift ;; 
+    -a | --all ) empty=true; stash=true; shift ;; 
+    -o | --outputfolder ) outputfolder="$2"; shift 2 ;; 
+    -f | --skipfetch ) skipfetch=true; shift ;; 
+    -c | --compress ) compress=true; shift ;; 
+    -- ) shift; break ;;
+    * ) break ;;
+  esac
+done
+
+# fetch any changes to the repo unless fetch is forced to be skipped
+$skipfetch || git fetch || echo -e "\e[31mMigrate: Failed to fetch latest changes" >&2 && exit 1 
+
+# get all branches, extra pipes to remove * from git branches list output
+branches=`git branch --list | sed -e 's/\(^\* \|^  \)//g' | cut -d " " -f 2`;
+
+# declare arrays for needed actions
+declare -a unpushed_arr
+$empty && declare -a empty_arr
+
+# analyse branches
+declare -i remotes=
+for branch in $branches; do
+  remotes=$( git branch -a | grep "origin/${branch}$" | wc -l )
+
+  if [[ $remotes > 0 ]] ; then
+    commits=$( git log --oneline --format="%h" origin/$branch..$branch | sed ':a;N;$!ba;s/\n/ /g' | wc -w )
+    if [[ $commits > 0 ]]; then
+      $dry && unpushed_arr+=("$branch:$commits") && continue;
+      unpushed_arr+=("$branch") 
+    fi
+  elif $empty ; then
+    empty_arr+=("$branch")
+  fi
+done
+
+# analyse stashes
+if $stash; then 
+
+  # get array of stashes (stash@{$id}:base_branch)
+  declare -a stashes_arr=( $(git stash list --format="%gd:%s" |
+  sed -e 's/\(:[^:]*\)//2' |
+  sed -e 's/\(WIP on \|On \)//g' ) )
+fi
+
+# print output report only if using --dry
+if $dry; then
+
+  # print branches analysis output
+  echo "${unpushed_arr[@]}" "${empty_arr[@]}" | 
+  sed -e 's/ /\n/g' | sort -t ':' -rnk 2 | awk '
+    BEGIN{ FS=":"; RS="\n";
+        print "---------------------------------------------------------------------------------"
+        print "> Branches analysis";
+        print "---------------------------------------------------------------------------------"
+        print "Branch name                                                  | Missing Updates   "
+        print "---------------------------------------------------------------------------------"
+    }
+    {
+        printf("%-60s | %-2s %-s\n",$1,$2?$2:"-",$2?"missing commits":"missing branch") 
+    }
+    END{
+        print "---------------------------------------------------------------------------------"
+        printf("* %-2d branches needs your attention\n", NR)
+        print "---------------------------------------------------------------------------------"
+    }
+  '
+
+  # print stashes analysis output
+   $stash && for item in ${stashes_arr[@]}; do 
+
+      id=`echo $item | cut -d ':' -f 1 | sed -e 's/[^0-9]*//g'`
+      branch=`echo $item | cut -d ':' -f 2`
+      changes=`git stash show --stat stash@{$id} | head -n -1 | wc -l`
+      echo "$id:$branch:$changes\n"
+    done | sort -t ':' -rnk 3 | awk '
+      BEGIN{ FS=":"; RS="\n";
+          print "> Stash analysis";
+          print "---------------------------------------------------------------------------------"
+          print "  ID  | Branch name                                          | Change(s) "
+          print "---------------------------------------------------------------------------------"
+      }
+      {
+          printf("%5d | %-52s | %-2d file(s) changed\n",$1,$2,$3)
+      }
+      END{
+          print "---------------------------------------------------------------------------------"
+          printf("* %-2d stashes needs your attention\n", NR)
+          print "* To view stash type git stash show stash@{ID}"
+          print "---------------------------------------------------------------------------------"
+      }
+  '
+
+  echo -e "\n\e[34mMigrate: Remove the --dry option to create backup. \n\e[33mfor more info run migrate --help\e[0m"
+  exit 0
+fi
+
+# prepare output structure
+if ! $dry ; then
+
+  # create backup directory if it doesn't exist
+  path="./$outputfolder"
+
+  [[ -f "repo_backup.tar.gz" ]] && rm repo_backup.tar.gz
+
+  [[ ! -d $path ]] && mkdir $outputfolder;
+  
+  [[ -d "$path/commits" ]] && rm -R "$path/commits"
+  [[ -d "$path/stash" ]] && rm -R "$path/stash"
+  
+  # if listing empty branches, remove any previous output
+  if $empty; then
+    empty_branches_file="${path}/emptybranches"
+    [[ -f $empty_branches_file ]] && rm $empty_branches_file
+  fi
+
+  # create stashes folder if needed
+  $stash && mkdir "$path/stash"
+
+fi
+
+# branches
+$verbose &&  printf "\n\e[1mMigrate: Generate branches patches\n\e[0m"
+
+for branch in ${unpushed_arr[@]}; do 
+  mkdir -p "${path}/commits/$branch"
+  quitemode="--quiet"
+
+  if $verbose; then 
+    quitemode=""
+    printf "\e[32m> generating patches for: ${branch} \n\e[0m"
+    printf "\e[90m"
+  fi
+
+  git format-patch "origin/${branch}..${branch}" \
+  -o "${path}/commits/$branch" $quiet | grep -o '[^/]*$'
+
+  $verbose && printf "\e[0m" 
+done
+
+# empty branches
+for branch in ${empty_arr[@]}; do 
+  [[ $empty_branches_file ]] && echo "${branch}" >> "$empty_branches_file";
+done
+
+# stashes
+$verbose && printf "\n\e[1mMigrate: Generate stashes patches\n\e[0m"
+
+for item in ${stashes_arr[@]}; do 
+  id=`echo $item | cut -d ':' -f 1 | sed -e 's/[^0-9]*//g'`
+  $verbose && echo -e "\e[90mstash@{$id}: stash_$id.patch\e[0m"    
+  git stash show -p "stash@{$id}" > "${path}/stash/stash_${id}"
+done
+
+if $compress; then 
+  $verbose && ! $dry &&  printf "\n\e[1mMigrate: Compressing files \n\e[0m"
+  # tar -czf repo_backup.tar.gz $path
+  cd $path/ && tar -zcf ../repo_backup.tar.gz . && cd - 
+  rm -R "$path"
+  echo -e "\n\e[34mMigrate: Patch files 'repo_backup.tar.gz' back up created \e[0m"
+else 
+  echo -e "\n\e[34mMigrate: Patch files successfully created at '$path'\e[0m"
+fi
+exit 0
